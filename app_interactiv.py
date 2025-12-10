@@ -1,5 +1,5 @@
 # ================================================
-# BOT DE RECOMANDARE INVESTIȚII CU LSTM - Versiune Interactiva
+# BOT DE TESTARE ISTORICĂ INVESTIȚII (BACKTESTING)
 # ================================================
 
 import streamlit as st
@@ -11,7 +11,7 @@ from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 from tensorflow.keras import Input
-from datetime import datetime, timedelta
+from datetime import datetime, date
 import tensorflow as tf
 import warnings
 import os
@@ -23,124 +23,208 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore", category=UserWarning, module="tensorflow")
 tf.config.run_functions_eagerly(True)
 
-st.set_page_config(page_title="Bot Investiții LSTM Interactiv", layout="wide")
-st.title("🤖 Bot de Recomandare Investiții cu LSTM (Interactiv)")
+st.set_page_config(page_title="Backtest Investiții LSTM", layout="wide")
+st.title("📉 Bot de Validare Istorică (Backtesting)")
 
-st.markdown("Aplicație educațională pentru predicția prețurilor acțiunilor cu ajustare interactivă a parametrilor modelului.")
+st.markdown("""
+Această aplicație antrenează un model LSTM pe o porțiune din datele selectate și **verifică performanța** comparând predicțiile cu prețurile reale care au avut loc deja.
+""")
 
 # ---- Sidebar pentru parametri
-st.sidebar.header("Parametri Model")
-years_back = st.sidebar.slider("Număr ani analiză istorică", min_value=1, max_value=20, value=10)
-epochs = st.sidebar.slider("Număr epoci LSTM", min_value=5, max_value=50, value=20)
-time_step = st.sidebar.slider("Lungime fereastră (time step)", min_value=10, max_value=120, value=60)
+st.sidebar.header("Parametri Configurare")
 
-# Dropdown simboluri
-tickers = ["AAPL", "GOOG", "TSLA", "MSFT", "AMZN", "BTC-USD"]
-symbol = st.selectbox("Selectați simbolul acțiunii:", tickers)
+# 1. Selecție Simbol
+tickers = ["AAPL", "GOOG", "TSLA", "MSFT", "AMZN", "BTC-USD", "NVDA", "META"]
+symbol = st.sidebar.selectbox("Selectați simbolul acțiunii:", tickers)
 
-if st.button("Rulează Predicția"):
+# 2. Selecție Perioadă (Constrângere: Max 1 Dec 2025)
+st.sidebar.subheader("Interval de Analiză")
+max_allowed_date = date(2025, 12, 1)
 
-    with st.spinner(f"Se descarcă datele pentru {symbol}..."):
-        end_date = datetime.today().date()
-        start_date = end_date - timedelta(days=365*years_back)
+start_date = st.sidebar.date_input(
+    "Data de Început", 
+    value=date(2020, 1, 1),
+    max_value=max_allowed_date
+)
+
+end_date = st.sidebar.date_input(
+    "Data de Final", 
+    value=date(2025, 1, 1),
+    max_value=max_allowed_date
+)
+
+if start_date >= end_date:
+    st.sidebar.error("Data de început trebuie să fie anterioară datei de final!")
+
+# 3. Parametri Tehnici
+st.sidebar.subheader("Setări AI")
+epochs = st.sidebar.slider("Număr epoci (Antrenament)", min_value=5, max_value=50, value=25)
+time_step = st.sidebar.slider("Fereastra de timp (zile)", min_value=10, max_value=90, value=60)
+split_percent = 0.80 # 80% antrenament, 20% testare
+
+# ---- Funcții Utilitare
+def calculate_accuracy(y_true, y_pred):
+    """Calculează acuratețea bazată pe MAPE (Mean Absolute Percentage Error)"""
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    accuracy = 100 - mape
+    return accuracy, mape
+
+# ---- Main Logic
+if st.button("Rulează Comparatia (Backtest)"):
+    if start_date >= end_date:
+        st.error("Interval de date invalid. Vă rugăm corectați datele în sidebar.")
+        st.stop()
+
+    with st.spinner(f"Descărcare date istorice pentru {symbol} ({start_date} -> {end_date})..."):
         try:
-            data = yf.download(symbol, start=start_date, end=end_date, auto_adjust=True, progress=False)
-            if data.empty:
-                st.error("Simbol invalid sau date indisponibile!")
+            # Descărcăm datele
+            df = yf.download(symbol, start=start_date, end=end_date, progress=False)
+            
+            # Verificăm dacă coloana 'Close' sau 'Adj Close' există (fix pentru versiuni noi yfinance)
+            if "Adj Close" in df.columns:
+                target_col = "Adj Close"
+            elif "Close" in df.columns:
+                target_col = "Close"
+            else:
+                st.error("Datele descărcate nu conțin coloana de preț ('Close').")
                 st.stop()
-        except Exception as e:
-            st.error(f"Eroare la descărcarea datelor: {e}")
-            st.stop()
+                
+            # Dacă df este gol
+            if df.empty or len(df) < time_step * 2:
+                st.error(f"Nu există suficiente date pentru intervalul selectat. (Minim necesar: {time_step*2} zile)")
+                st.stop()
+                
+            prices = df[[target_col]].values
 
-    prices = data["Close"].values.reshape(-1,1)
+        except Exception as e:
+            st.error(f"Eroare critică la preluarea datelor: {e}")
+            st.stop()
 
     # ---- Preprocesare
     scaler = MinMaxScaler(feature_range=(0,1))
-    scaled = scaler.fit_transform(prices)
+    scaled_data = scaler.fit_transform(prices)
 
-    def create_dataset(dataset, time_step):
-        X, y = [], []
+    # Împărțire Train (80%) / Test (20%)
+    training_size = int(len(scaled_data) * split_percent)
+    test_size = len(scaled_data) - training_size
+    train_data, test_data = scaled_data[0:training_size, :], scaled_data[training_size-time_step:len(scaled_data), :]
+
+    def create_dataset(dataset, time_step=1):
+        X, Y = [], []
         for i in range(len(dataset)-time_step-1):
-            X.append(dataset[i:(i+time_step),0])
-            y.append(dataset[i+time_step,0])
-        return np.array(X), np.array(y)
+            a = dataset[i:(i+time_step), 0]
+            X.append(a)
+            Y.append(dataset[i + time_step, 0])
+        return np.array(X), np.array(Y)
 
-    X, y = create_dataset(scaled, time_step)
-    X = X.reshape(X.shape[0], X.shape[1], 1)
+    # Creare seturi X, y
+    X_train, y_train = create_dataset(train_data, time_step)
+    X_test, y_test = create_dataset(test_data, time_step)
 
-    # ---- Model LSTM
+    # Reshape pentru LSTM [samples, time steps, features]
+    X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
+    X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
+
+    # ---- Construire Model
     model = Sequential([
-        Input(shape=(time_step,1)),
-        LSTM(64, return_sequences=True),
-        LSTM(64),
+        Input(shape=(time_step, 1)),
+        LSTM(50, return_sequences=True),
+        LSTM(50, return_sequences=False),
+        Dense(25),
         Dense(1)
     ])
-    model.compile(loss="mean_squared_error", optimizer="adam")
+    model.compile(optimizer='adam', loss='mean_squared_error')
 
-    with st.spinner("Se antrenează modelul LSTM..."):
-        model.fit(X, y, epochs=epochs, batch_size=32, verbose=0)
+    # ---- Antrenare
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    status_text.text("Antrenare model LSTM (poate dura câteva secunde)...")
+    # Callback simplu nu e afișat în Streamlit ușor, deci antrenăm direct
+    model.fit(X_train, y_train, batch_size=32, epochs=epochs, verbose=0)
+    progress_bar.progress(100)
+    status_text.text("Antrenare completă!")
 
-    # ---- Predicție viitor
-    forecast_target = datetime(2025,12,31).date()
-    forecast_days = (forecast_target - end_date).days
-    if forecast_days <= 0:
-        st.warning("Data finală deja trecută. Se vor afișa doar date istorice.")
-        forecast_days = 0
+    # ---- Predicții
+    train_predict = model.predict(X_train, verbose=0)
+    test_predict = model.predict(X_test, verbose=0)
 
-    last_window = scaled[-time_step:]
-    future_predictions = []
-    current_input = last_window.copy()
+    # Inversare scalare pentru a ajunge la prețurile reale
+    train_predict = scaler.inverse_transform(train_predict)
+    y_train_real = scaler.inverse_transform([y_train])
+    test_predict = scaler.inverse_transform(test_predict)
+    y_test_real = scaler.inverse_transform([y_test])
 
-    for _ in range(forecast_days):
-        pred = model.predict(current_input.reshape(1,time_step,1), verbose=0)
-        future_predictions.append(pred[0,0])
-        current_input = np.append(current_input[1:], pred)
-        current_input = current_input.reshape(time_step,1)
+    # ---- Calcul Acuratețe (doar pe zona de Test)
+    accuracy, mape = calculate_accuracy(y_test_real[0], test_predict[:,0])
+    
+    # ---- Pregătire date pentru Vizualizare
+    # Ajustăm indicii pentru a se alinia cu datele originale
+    train_plot = np.empty_like(scaled_data)
+    train_plot[:, :] = np.nan
+    # Shift train predictions for plotting
+    train_plot[time_step:len(train_predict)+time_step, :] = train_predict
 
-    future_prices = scaler.inverse_transform(np.array(future_predictions).reshape(-1,1))
-    future_dates = pd.date_range(start=data.index[-1]+pd.Timedelta(days=1), periods=forecast_days, freq="D") if forecast_days>0 else []
-    future_df = pd.DataFrame(future_prices, index=future_dates, columns=["Predicted_Close"]) if forecast_days>0 else pd.DataFrame()
+    test_plot = np.empty_like(scaled_data)
+    test_plot[:, :] = np.nan
+    # Shift test predictions for plotting
+    # Start index for test plot is len(train_predict) + (time_step * 2) + 1 roughly, 
+    # but strictly based on how we sliced 'test_data' which included lookback
+    test_start_idx = len(train_predict) + (time_step * 2) + 1
+    # Simplificare aliniere folosind indicii originali din df
+    
+    # Creăm un DataFrame curat pentru comparatia Test vs Real
+    test_indices = df.index[training_size + 1 : len(df) - 1] 
+    # Ajustare fină lungime
+    min_len = min(len(test_indices), len(y_test_real[0]), len(test_predict))
+    
+    comparison_df = pd.DataFrame({
+        "Data": test_indices[:min_len],
+        "Preț Real": y_test_real[0][:min_len],
+        "Preț Predis (AI)": test_predict[:,0][:min_len]
+    }).set_index("Data")
 
-    # ---- Grafic cu trend colorat
-    st.subheader(f"Grafic Istoric + Predicție {symbol}")
-    fig, ax = plt.subplots(figsize=(12,5))
-    ax.plot(data["Close"], label="Valori istorice", linewidth=2, color="blue")
+    comparison_df["Diferența"] = comparison_df["Preț Real"] - comparison_df["Preț Predis (AI)"]
 
-    if forecast_days>0:
-        trend_change = future_prices[-1] - prices[-1][0]
-        color = "green" if trend_change > 0 else "red" if trend_change < 0 else "gold"
-        ax.plot(future_df["Predicted_Close"], label="Predicții viitoare", linestyle='--', color=color)
+    # ---- AFIȘARE REZULTATE ----
+    st.divider()
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Simbol", symbol)
+    with col2:
+        st.metric("Acuratețe Estimată", f"{accuracy:.2f}%")
+    with col3:
+        st.metric("Eroare Medie (MAPE)", f"{mape:.2f}%")
+        
+    st.subheader(f"Grafic Comparativ: {symbol}")
+    st.caption("Linia Albastră: Preț Real | Linia Roșie: Predicția AI (pe date necunoscute la antrenare)")
 
-    ax.set_xlabel("Dată")
+    fig, ax = plt.subplots(figsize=(14, 6))
+    
+    # Plot Preț Real Complet
+    ax.plot(df.index, scaler.inverse_transform(scaled_data), label="Istoric Real Complet", color='blue', alpha=0.6)
+    
+    # Plot Predicție Test (Doar zona portocalie/rosie)
+    # Aliniem axa X a predicțiilor cu datele din comparison_df
+    ax.plot(comparison_df.index, comparison_df["Preț Predis (AI)"], label="Predicție AI (Test)", color='red', linewidth=2)
+    
+    ax.set_xlabel("Data")
     ax.set_ylabel("Preț (USD)")
-    ax.grid(True)
     ax.legend()
+    ax.grid(True, alpha=0.3)
     st.pyplot(fig)
 
-    # ---- Recomandare colorată
-    last_real = prices[-1][0]
-    predicted_mean = np.mean(future_prices[-30:]) if forecast_days>0 else last_real
+    # ---- Tabel Detaliat
+    st.subheader("📊 Date Detaliate (Ultimele 10 zile din interval)")
+    st.dataframe(comparison_df.tail(10).style.format("{:.2f}"))
 
-    if predicted_mean > last_real * 1.05:
-        recommendation = "📈 BUY (tendință de creștere estimată)"
-        rec_color = "green"
-    elif predicted_mean < last_real * 0.95:
-        recommendation = "📉 SELL (tendință de scădere estimată)"
-        rec_color = "red"
-    else:
-        recommendation = "⚖️ HOLD (tendință stabilă estimată)"
-        rec_color = "gold"
-
-    st.subheader("💡 Recomandare finală")
-    st.markdown(f"<h3 style='color:{rec_color}'>{recommendation}</h3>", unsafe_allow_html=True)
-    st.markdown(f"**Preț actual:** {last_real:.2f} USD  \n**Preț mediu estimat (ultimele 30 zile):** {predicted_mean:.2f} USD")
-
-    # ---- Descarcă grafic
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png")
+    # Descărcare CSV
+    csv = comparison_df.to_csv().encode('utf-8')
     st.download_button(
-        label="⬇️ Descarcă graficul PNG",
-        data=buf,
-        file_name=f"{symbol}_prediction.png",
-        mime="image/png"
+        "⬇️ Descarcă Raportul Comparativ (CSV)",
+        csv,
+        "raport_predictie.csv",
+        "text/csv",
+        key='download-csv'
     )
